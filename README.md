@@ -37,7 +37,6 @@ cargo install bindgen-cli
 `linux$ make LLVM=1 rustavailable` - should show `Rust is available!`
 
 ### setup
-`$ chmod +x scripts/setup.sh`
 `$ ./scripts/setup.sh`
 
 ## Compiling the kernel
