@@ -2,6 +2,8 @@
 ## Cloning the repo properly with submodules
 `git clone --recurse-submodules https://github.com/giji676/giji-lsm.git`
 
+`./scripts/submodule_setup.sh`
+
 ## Setting up the environment
 Mainly adapted from https://medium.com/@sumant1122/writing-your-first-rust-linux-kernel-module-from-zero-to-insmod-d49669eb6737
 
@@ -44,3 +46,8 @@ cargo install bindgen-cli
 
 ## Running the kernel
 `$ ./run.sh`
+
+# Viewing changes made
+To view the full changes made to add the LSM run: </br>
+`linux$ git diff origin/master` - for full diff </br>
+`linux$ git diff origin/master --names-only` - for only the names of the files affected
