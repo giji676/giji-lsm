@@ -40,4 +40,42 @@ provide the safe, idiomatic interface that Rust kernel code is expected to use.
  ```
 
 # Coding Guidelines
+## Style and formating
+- Rust code should be formatted using `rustfmt` with the default settings.
+- Idiomatic Rust style should be followed, unlike C kernel code.
+
+## Imports
+- Imports should use vertical layout with one item per line, and braces are used when there is more than one item in the list.
+- Empty trailing comments (`//`) are sometimes used to preserve this formatting.
+
+## Comments
+- Normal comments use `//` and will not be rendered by rustdoc.
+- Capitalised at the beginning and ended with a period, including `// SAFETY:`, `// TODO:`, and other tagged comments.
+- Comments should not be used for documentation.
+- Special `// SAFETY:` comments must appear before every `unsafe` block to explain it's safety and soundness guarantees.
+
+## Code documentation
+- Documentation comments use `///` or `//!`, which get rendered by `rustdoc`.
+- Unsafe functions must document their safety preconditions under a `# Safety` section.
+- `srctree/` prefix can be used for creating links relative to the link destination. E.g. `srctree/include/linux/mutex.h`.
+
+## C FFI types
+- Use the kernel-provided aliases (e.g. `c_int`, `c_char`) instead of
+  `core::ffi` types.
+
+## Naming
+- Follow standard Rust naming conventions.
+- When wrapping existing C APIs, names should remain as close as possible to
+  the original C names while adopting Rust casing conventions.
+
+## Lints
+- Prefer `#[expect(...)]` over `#[allow(...)]` where possible, since it warns
+  when the suppression is no longer needed.
+- Use `allow` only when conditional compilation or architecture-specific code
+  makes `expect` impractical
+
+## Error handling
+- Prefer Rust's `Result`-based error handling over panicing where possible.
+- Panics should be rare in kernel code.
+
 # Testing
