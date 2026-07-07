@@ -22,6 +22,11 @@ scripts/config --enable CONFIG_RUST
 scripts/config --enable CONFIG_SAMPLES
 scripts/config --enable CONFIG_SAMPLES_RUST
 scripts/config --enable CONFIG_SECURITY
-scripts/config --enable CONFIG_SECURITY_GIJI
+scripts/config --enable CONFIG_SECURITYFS
+
+scripts/config --enable CONFIG_SECURITY_YAMA
+# scripts/config --enable CONFIG_SECURITY_GIJI
+# scripts/config --enable CONFIG_NET
+# scripts/config --enable CONFIG_SECURITY_APPARMOR
 
 make LLVM=1 olddefconfig
