@@ -8,6 +8,11 @@ rm -f "$ROOT/initramfs.cpio.gz"
 
 mkdir -p "$ROOT/initramfs"/{bin,sbin,dev,proc,sys,tmp}
 
+gcc -g -static test.c -o tests
+
+cp tests initramfs/bin/
+chmod +x initramfs/bin/tests
+
 # Copy the busybox
 cp /usr/bin/busybox "$ROOT/initramfs/bin/"
 
