@@ -1,3 +1,4 @@
 initramfs.cpio.gz
 rust-project.json
 initramfs/
+tests
