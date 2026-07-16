@@ -118,14 +118,25 @@ static enum command recv_cmd(int fd)
     return cmd;
 }
 
+static void signal_ready(int ready_fd)
+{
+    char byte = 1;
+    write(ready_fd, &byte, 1);
+}
+
 struct test_case {
     const char *name;
     int scope;
 
     /* Child performs its own ptrace call (e.g. PTRACE_TRACEME) and reports
-     * the result over `result_fd`. May be NULL if the child doesn't
-     * perform a ptrace call under test (e.g. it's just the attach target). */
-    void (*child)(int result_fd, int cmd_fd);
+     * the result over `result_fd`. May be NULL if the child doesn't perform a
+     * ptrace call under test (e.g. it's just the attach target).
+     *
+     * `ready_fd`: child must write one byte here once it has
+     * completed any setup that `parent` depends on (e.g. PR_SET_PTRACER), and
+     * before it does anything that `parent`'s ptrace call is meant to
+     * observe. run_test() blocks on this before calling `parent`. */
+    void (*child)(int result_fd, int cmd_fd, int ready_fd);
 
     /* Parent performs its own ptrace call (e.g. PTRACE_ATTACH) and returns
      * the result directly, since it runs in the harness's own process. */
@@ -143,8 +154,9 @@ static void run_test(const struct test_case *test)
 
     int cmd_pipe[2];
     int result_pipe[2];
+    int ready_pipe[2];
 
-    if (pipe(cmd_pipe) < 0 || pipe(result_pipe) < 0) {
+    if (pipe(cmd_pipe) < 0 || pipe(result_pipe) < 0 || pipe(ready_pipe)) {
         perror("pipe");
         return;
     }
@@ -160,12 +172,14 @@ static void run_test(const struct test_case *test)
 
         close(cmd_pipe[1]);    /* child only reads commands */
         close(result_pipe[0]); /* child only writes results */
+        close(ready_pipe[0]);  /* child only writes ready status */
 
         if (test->child)
-            test->child(result_pipe[1], cmd_pipe[0]);
+            test->child(result_pipe[1], cmd_pipe[0], ready_pipe[1]);
 
         close(cmd_pipe[0]);
         close(result_pipe[1]);
+        close(ready_pipe[1]);
 
         _exit(EXIT_SUCCESS);
     }
@@ -174,14 +188,20 @@ static void run_test(const struct test_case *test)
 
     close(cmd_pipe[0]);    /* parent only writes commands */
     close(result_pipe[1]); /* parent only reads results */
+    close(ready_pipe[1]);  /* parent only reads ready status */
+
+    /* Block until the child has finished any setup it needs to do before
+     * `parent`'s ptrace call is meaningful. */
+    char ready;
+    ssize_t rn = read(ready_pipe[0], &ready, 1);
+    close(ready_pipe[0]);
+    if (rn != 1)
+        printf("  (child never signaled ready)\n");
 
     struct result parent_res = {0, 0};
 
     if (test->parent)
         parent_res = test->parent(pid, cmd_pipe[1]);
-
-    // send_cmd(cmd_pipe[1], CMD_EXIT);
-    // kill(pid, SIGKILL);
 
     close(cmd_pipe[1]);
 
@@ -245,34 +265,49 @@ static void report(int result_fd, int rc)
     write(result_fd, &res, sizeof(res));
 }
 
-static void child_traceme(int result_fd, int cmd_fd)
+static void child_traceme(int result_fd, int cmd_fd, int ready_fd)
 {
+    (void)cmd_fd;
+    signal_ready(ready_fd);
     int rc = ptrace(PTRACE_TRACEME, 0, NULL, NULL);
     report(result_fd, rc);
 }
 
-static void child_pause(int result_fd, int cmd_fd)
+static void child_pause(int result_fd, int cmd_fd, int ready_fd)
 {
     (void)result_fd;
+    signal_ready(ready_fd);
 
     for (;;) {
         switch (recv_cmd(cmd_fd)) {
         case CMD_RUN:
             return;
-
         case CMD_EXIT:
             _exit(0);
-
         default:
             break;
         }
     }
 }
 
-static void child_pr_set_ptracer(int result_id, int cmd_fd)
+static void child_pr_set_ptracer(int result_fd, int cmd_fd, int ready_fd)
 {
-    (void)result_id;
+    (void)result_fd;
+
     prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+
+    signal_ready(ready_fd);
+
+    for (;;) {
+        switch (recv_cmd(cmd_fd)) {
+        case CMD_RUN:
+            return;
+        case CMD_EXIT:
+            _exit(0);
+        default:
+            break;
+        }
+    }
 }
 
 static void child_capability_yes(int result_fd, int cmd_fd)
@@ -306,7 +341,7 @@ static void child_capability_no(int result_fd, int cmd_fd)
     }
 }
 
-static void child_traceme_parent_no_cap(int result_fd, int cmd_fd)
+static void child_traceme_parent_no_cap(int result_fd, int cmd_fd, int ready_fd)
 {
     (void)cmd_fd;
 
@@ -315,6 +350,7 @@ static void child_traceme_parent_no_cap(int result_fd, int cmd_fd)
     pid_t inner = fork();
     if (inner < 0) {
         perror("fork (inner)");
+        signal_ready(ready_fd);
         struct result r = { .rc = -1, .err = EIO };
         write(result_fd, &r, sizeof(r));
         _exit(1);
@@ -446,15 +482,23 @@ static struct test_case tests[] = {
         .child = child_pause,
         .parent = parent_try_attach,
         .expect_child = EXPECT_NONE,
-        .expect_parent = EXPECT_OK, /* real parent -> descendant check passes */
+        .expect_parent = EXPECT_OK,
     },
     {
-        .name = "RELATIONAL: PR_SET_PTRACER",
+        .name = "RELATIONAL: unrelated tracer, no exception, no cap",
+        .scope = YAMA_SCOPE_RELATIONAL,
+        .child = child_pause,
+        .parent = parent_try_attach_no_cap,
+        .expect_child = EXPECT_NONE,
+        .expect_parent = EXPECT_DENIED(EPERM),
+    },
+    {
+        .name = "RELATIONAL: PR_SET_PTRACER exception, tracer lacks cap",
         .scope = YAMA_SCOPE_RELATIONAL,
         .child = child_pr_set_ptracer,
-        .parent = parent_do_nothing,
-        .expect_child = EXPECT_NONE, /* TODO: not implemented yet */
-        .expect_parent = EXPECT_NONE,
+        .parent = parent_try_attach_no_cap,
+        .expect_child = EXPECT_NONE,
+        .expect_parent = EXPECT_OK,
     },
 
     /* Scope 2 */
