@@ -50,9 +50,9 @@ or</br>
 `$ ./run.sh`
 
 ## Running the tests
-inside the qemu instance:
-`cd bin/`
-`./test`
+inside the qemu instance:</br>
+`cd bin/`</br>
+`./tests`</br>
 
 # Viewing changes made
 To view the full changes made to add the LSM run: </br>
