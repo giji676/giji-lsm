@@ -42,10 +42,17 @@ cargo install bindgen-cli
 `$ ./scripts/setup.sh`
 
 ## Compiling the kernel
-`linux$ make LLVM=1 -j$(nproc)`
+`$ ./scripts/build.sh`</br>
+or</br>
+`linux$ make LLVM=1 -j$(nproc)`</br>
 
 ## Running the kernel
 `$ ./run.sh`
+
+## Running the tests
+inside the qemu instance:
+`cd bin/`
+`./test`
 
 # Viewing changes made
 To view the full changes made to add the LSM run: </br>
