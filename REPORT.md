@@ -68,3 +68,7 @@ This project demonstrated that components of Linux Security Modules can be succe
 The project also highlighted the practical challenges of introducing Rust into a C codebase. While higher-level kernel functionality could be expressed safely in Rust, lower-level primitives such as RCU operations and memory access mechanisms still relied on existing C implementations accessed through bindings.
 
 Finally, the dependency analysis demonstrated that examining the dependency hierarchy of a kernel component provides a useful indication of both the implementation effort required and the potential safety improvements that can be achieved through migration. These observations may help guide future efforts to expand Rust support within the Linux kernel.
+
+# Links
+Project GitHub repo: [giji-lsm](https://github.com/giji676/giji-lsm)
+My version of Linux fork: [Linux-fork](https://github.com/giji676/linux/tree/giji-lsm)
