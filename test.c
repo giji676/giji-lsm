@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/prctl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,7 +147,7 @@ struct test_case {
     struct expect expect_parent;
 };
 
-static void run_test(const struct test_case *test)
+static bool run_test(const struct test_case *test)
 {
     printf("\n---- %s ----\n", test->name);
 
@@ -158,13 +159,13 @@ static void run_test(const struct test_case *test)
 
     if (pipe(cmd_pipe) < 0 || pipe(result_pipe) < 0 || pipe(ready_pipe)) {
         perror("pipe");
-        return;
+        return false;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        return;
+        return false;
     }
 
     if (pid == 0) {
@@ -229,6 +230,11 @@ static void run_test(const struct test_case *test)
 
     print_result("child", &test->expect_child, &child_res);
     print_result("parent", &test->expect_parent, &parent_res);
+
+    bool child_pass = result_matches(&test->expect_child, &child_res);
+    bool parent_pass = result_matches(&test->expect_parent, &parent_res);
+
+    return child_pass && parent_pass;
 }
 
 static void drop_cap_sys_ptrace(void)
@@ -290,12 +296,17 @@ static void child_pause(int result_fd, int cmd_fd, int ready_fd)
     }
 }
 
-static void child_pr_set_ptracer(int result_fd, int cmd_fd, int ready_fd)
+static void child_pr_set_ptracer(int result_fd, int cmd_fd,
+                                 int ready_fd, unsigned long pid)
 {
-    (void)result_fd;
+    // (void)result_fd;
 
-    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+    // arg2: PID of a process that is allowed to trace.
+    // Returns EINVAL if it's not 0, PR_SET_PTRACER_ANY, or PID of
+    // an existing process.
+    int rc = prctl(PR_SET_PTRACER, pid, 0, 0, 0);
 
+    report(result_fd, rc);
     signal_ready(ready_fd);
 
     for (;;) {
@@ -310,10 +321,19 @@ static void child_pr_set_ptracer(int result_fd, int cmd_fd, int ready_fd)
     }
 }
 
-static void child_capability_yes(int result_fd, int cmd_fd)
+static void child_pr_set_ptracer_0(int result_fd, int cmd_fd, int ready_fd)
 {
-    (void)result_fd;
-    /* TODO: arrange CAP_SYS_PTRACE, attempt attach */
+    child_pr_set_ptracer(result_fd, cmd_fd, ready_fd, 0);
+}
+
+static void child_pr_set_ptracer_any(int result_fd, int cmd_fd, int ready_fd)
+{
+    child_pr_set_ptracer(result_fd, cmd_fd, ready_fd, PR_SET_PTRACER_ANY);
+}
+
+static void child_pr_set_ptracer_invalid(int result_fd, int cmd_fd, int ready_fd)
+{
+    child_pr_set_ptracer(result_fd, cmd_fd, ready_fd, 999999);
 }
 
 static void child_capability_no(int result_fd, int cmd_fd)
@@ -493,11 +513,27 @@ static struct test_case tests[] = {
         .expect_parent = EXPECT_DENIED(EPERM),
     },
     {
-        .name = "RELATIONAL: PR_SET_PTRACER exception, tracer lacks cap",
+        .name = "RELATIONAL: PR_SET_PTRACER 0, tracer has cap",
         .scope = YAMA_SCOPE_RELATIONAL,
-        .child = child_pr_set_ptracer,
-        .parent = parent_try_attach_no_cap,
-        .expect_child = EXPECT_NONE,
+        .child = child_pr_set_ptracer_0,
+        .parent = parent_try_attach,
+        .expect_child = EXPECT_OK,
+        .expect_parent = EXPECT_OK,
+    },
+    {
+        .name = "RELATIONAL: PR_SET_PTRACER any, tracer has cap",
+        .scope = YAMA_SCOPE_RELATIONAL,
+        .child = child_pr_set_ptracer_any,
+        .parent = parent_try_attach,
+        .expect_child = EXPECT_OK,
+        .expect_parent = EXPECT_OK,
+    },
+    {
+        .name = "RELATIONAL: PR_SET_PTRACER invalid, tracer has cap",
+        .scope = YAMA_SCOPE_RELATIONAL,
+        .child = child_pr_set_ptracer_invalid,
+        .parent = parent_try_attach,
+        .expect_child = EXPECT_DENIED(EINVAL),
         .expect_parent = EXPECT_OK,
     },
 
@@ -551,9 +587,23 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
 
     size_t count = sizeof(tests) / sizeof(tests[0]);
+    size_t passed = 0;
+    size_t failed = 0;
 
-    for (size_t i = 0; i < count; i++)
-        run_test(&tests[i]);
+    for (size_t i = 0; i < count; i++) {
+        if (run_test(&tests[i]))
+            passed++;
+        else
+            failed++;
+    }
 
-    return 0;
+    printf("\n==================================================\n");
+    printf("Test summary\n");
+    printf("==================================================\n");
+    printf("Total:  %zu\n", count);
+    printf("Passed: %zu\n", passed);
+    printf("Failed: %zu\n", failed);
+    printf("==================================================\n");
+
+    return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
