@@ -34,6 +34,14 @@ For this project, the focus was on reimplementing selected Yama functionality in
 
 Supporting this implementation required reimplementing several kernel helper functions and macros in Rust, including `list_for_each_entry_rcu`, `container_of`, `list_entry_rcu`, `has_ns_capability`, and additional RCU, capability, and task management utilities that were not yet available through the Rust-for-Linux bindings.
 
+# Testing
+To verify the functionality of the Rust implementation, I designed a small testing framework to allow quick and easy adition of tests, and reusability of setup functions.
+As Yama's primary functionality is around one process `ptrace`-ing another process, the framework spawns two processes per test case, with different setups. Test cases get defined as a list of structs, each one having a child and parent setup function pointers, their expected return values, and Yama scope.
+The test framework first sets the Yama scope by writing to `/proc/sys/kernel/yama/ptrace_scope`. Then spawns the child and parent processes. The two processes communicate via pipes to signal ready, commands and results. After the processes have been spawned the child process setup is run, and parent waits for that to complete. The child setup can involve things like calling `PTRACE_TRACEME`, setting `PR_SET_PTRACER` and more. After child finishes setup the parent setup gets run, which might attempt the `PTRACE_ATTACH` with various capabilities.
+The results of these child and parent functions are what get testes. For example, if a child tries to set `PR_SET_PTRACER` with an invalid `PID` an error is expected, or if parent tries to attach to the child process without the right capability, permission will be denied.
+This allows multiple test cases to share setup functions, for example to test the same Yama function with different scopes, all you need to do is copy the test case struct, and change the `.scope` field.
+There is a problem with the framework however that I was not able to fix. Setting the `YAMA_SCOPE_NO_ATTACH` as the scope causes any future scope changes to be invalid, therefore it can't be changed back to lower scopes. Because of this, I've structured the test cases so they increase in scope, with the last (highest level) being the no attach scope. It also means that re-runing the test program fails as it can't start from the low scope, so restart of the kernel is required - which is fast to do through QEMU so it didn't hinder development.
+
 # Project Outcomes
 - Successfully reimplemented 3 of the 4 LSM hooks used by Yama in Rust while preserving the behaviour of the original C implementation.
 - Demonstrated that existing Linux Security Module functionality can be migrated to Rust, while working with the surrounding C kernel code.
@@ -71,4 +79,4 @@ Finally, the dependency analysis demonstrated that examining the dependency hier
 
 # Links
 Project GitHub repo: [giji-lsm](https://github.com/giji676/giji-lsm)
-My version of Linux fork: [Linux-fork](https://github.com/giji676/linux/tree/giji-lsm)
+My fork of Linux: [Linux-fork](https://github.com/giji676/linux/tree/giji-lsm)
