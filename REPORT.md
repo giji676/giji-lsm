@@ -1,13 +1,13 @@
 # Project Objective
 The goal of this project was to identify a Linux Security Module (LSM) within the Linux kernel and reimplement part of it in Rust while preserving its behaviour and improving memory safety. Rust provides stronger memory safety guarantees through its ownership model, borrow checker, and type system, eliminating many classes of memory errors at compile time.
 
-The challenge with writing a Linux Security Module (LSM) in Rust is that it must work with the C code that the rest of the kernel is written in. This includes registering a module written in Rust with the LSM framework, or implementing some of the functionality from existing C modules in Rust. Both require tight coupling between Rust and C, including calling C APIs, accessing C data structures, and sharing ownership of kernel objects. This interoperability requires `unsafe` code when interacting with C APIs and raw pointers. These sections cannot be fully verified by the compiler, placing responsibility for memory safety on the programmer.
+The challenge with writing an LSM in Rust is that it must work with the C code that the rest of the kernel is written in. This includes registering a module written in Rust with the LSM framework, or implementing some of the functionality from existing C modules in Rust. Both require tight coupling between Rust and C, including calling C APIs, accessing C data structures, and sharing ownership of kernel objects. This interoperability requires `unsafe` code when interacting with C APIs and raw pointers. These sections cannot be fully verified by the compiler, placing responsibility for memory safety on the programmer.
 
 # Linux Security Modules
 LSM is a framework that allows security modules to be added to the Linux kernel. It provides hooks that are called whenever important kernel objects are accessed from userspace, such as `inodes`. Security modules register implementations of these hooks to enforce access control policies, determining whether a requested operation should be permitted or denied.
 
 # The Yama LSM
-One of the existing LSMs is Yama, which provides access control for the `ptrace` syscall. `ptrace` allows one process to inspect the memory of another processes and is commonly used by debuggers such as `gdb`. While this feature is essential for debugging, it also presents a security risk, as a compromised process may attempt to inspect or manipulate other processes owned by the same user.
+One of the existing LSMs is Yama, which provides access control for the `ptrace` syscall. `ptrace` allows one process to inspect the memory of another process and is commonly used by debuggers such as `gdb`. While this feature is essential for debugging, it also presents a security risk, as a compromised process may attempt to inspect or manipulate other processes owned by the same user.
 
 Yama mitigates this risk by limiting which processes may use `ptrace`. The restrictions are controlled by `ptrace_scope`, which supports four security levels:
 ```
@@ -20,7 +20,7 @@ Internally, Yama implements four LSM hooks related to process tracing: `ptrace_a
 
 Yama was selected because it is a relatively self-contained LSM whose functionality relies heavily on kernel data structures and interactions with existing C code, making it a suitable case study for evaluating Rust integration within the Linux kernel.
 
-For this project, the focus was on reimplementing selected Yama functionality in Rust while preserving the original behaviour. This required implementing the existing C functionality in Rust alongside supporting kernel infrastructure, including bindings for kernel APIs, LSM registration, linked lists, and process management. The implementation therefore involved the use of FFI and `unsafe` code where interaction with C APIs was necessary, while using Rust's type system to provide stronger safety guarantees where possible.
+For this project, the focus was on reimplementing selected Yama functionality in Rust while preserving the original behaviour. This meant translating existing C policy logic into Rust and adding the supporting pieces needed to call into the kernel, mainly bindings and helpers for tasks, credentials, capabilities, and RCU. LSM and hook registration were left in C. Where interaction with C APIs was unavoidable, the implementation used FFI and `unsafe` code; elsewhere it relied on Rust's type system for stronger safety guarantees.
 
 # Implementation
 - Implemented three of Yama's four LSM hooks in Rust:
@@ -33,6 +33,170 @@ For this project, the focus was on reimplementing selected Yama functionality in
 - Verified that the Rust implementation behaved consistently with the original C implementation through functional testing across the different `ptrace_scope` security levels.
 
 Supporting this implementation required reimplementing several kernel helper functions and macros in Rust, including `list_for_each_entry_rcu`, `container_of`, `list_entry_rcu`, `has_ns_capability`, and additional RCU, capability, and task management utilities that were not yet available through the Rust-for-Linux bindings.
+
+# Example implementation: `yama_ptrace_access_check`
+One of the functions migrated during the project was `yama_ptrace_access_check`. This function implements the core Yama attach policy: when a process attempts `PTRACE_ATTACH`, Yama decides whether the attach is allowed according to the current `ptrace_scope` value. It was a suitable case study because it combines several aspects of the migration work in a single function: translating C control flow into Rust, interacting with `task_struct`, using RCU, performing capability checks, calling other helpers, and preserving the original security logic while interoperating with C through FFI.
+
+## Integrating with the existing C hook
+The LSM hook table still points at the original C entry point for all four hook functions. Under a `RUST` build flag, those functions immediately delegate to their Rust implementations and return their results, so the original C body is not executed:
+
+```C
+static int yama_ptrace_access_check(struct task_struct *child,
+                                    unsigned int mode)
+{
+#ifdef RUST
+        return rust_yama_ptrace_access_check(child, mode, ptrace_scope);
+#endif
+        /* original C implementation follows when RUST is not defined */
+        ...
+}
+```
+
+This keeps LSM registration and hook wiring in C for now, while the policy decision itself runs in Rust. Once Yama's LSM registration is moved to Rust, the Rust function is expected to be registered directly in the hook table rather than being reached through the C wrapper. The `ptrace_scope` value is passed as an argument for simplicity, rather than having to read the global value.
+
+## Original C implementation
+In the original Yama LSM, the function has the following form:
+
+```C 
+static int yama_ptrace_access_check(struct task_struct *child,
+                                    unsigned int mode)
+{
+        int rc = 0;
+
+        if (mode & PTRACE_MODE_ATTACH) {
+                switch (ptrace_scope) {
+                case YAMA_SCOPE_DISABLED:
+                        break;
+                case YAMA_SCOPE_RELATIONAL:
+                        rcu_read_lock();
+                        if (!pid_alive(child))
+                                rc = -EPERM;
+                        if (!rc && !task_is_descendant(current, child) &&
+                            !ptracer_exception_found(current, child) &&
+                            !ns_capable(__task_cred(child)->user_ns,
+                                        CAP_SYS_PTRACE))
+                                rc = -EPERM;
+                        rcu_read_unlock();
+                        break;
+                case YAMA_SCOPE_CAPABILITY:
+                        rcu_read_lock();
+                        if (!ns_capable(__task_cred(child)->user_ns,
+                                        CAP_SYS_PTRACE))
+                                rc = -EPERM;
+                        rcu_read_unlock();
+                        break;
+                case YAMA_SCOPE_NO_ATTACH:
+                default:
+                        rc = -EPERM;
+                        break;
+                }
+        }
+
+        if (rc && (mode & PTRACE_MODE_NOAUDIT) == 0)
+                report_access("attach", child, current);
+
+        return rc;
+}
+```
+
+The function only applies additional restrictions when `PTRACE_MODE_ATTACH` is set. Under `YAMA_SCOPE_RELATIONAL`, an attach is allowed only if the tracer is an ancestor of the target, an exception has been registered, or the tracer has `CAP_SYS_PTRACE` in the target's user namespace. Under `YAMA_SCOPE_CAPABILITY`, only the capability check remains. Under `YAMA_SCOPE_NO_ATTACH`, all attaches are denied. Failed attaches may also be audited through `report_access`.
+
+## Rust implementation
+The corresponding Rust implementation preserves this policy while adapting it to the constraints of the Rust-for-Linux environment:
+
+```Rust
+/// yama_ptrace_access_check written in Rust.
+///
+/// # Safety
+///
+/// `child` must be a valid `task_struct` pointer, valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_yama_ptrace_access_check(
+    child: *mut bindings::task_struct,
+    mode: ffi::c_uint,
+    ptrace_scope: ffi::c_int
+) -> ffi::c_int {
+    let mut rc: ffi::c_int = 0;
+
+    let current = current!();
+    let current_ptr = current.as_ptr();
+
+    if mode & bindings::PTRACE_MODE_ATTACH != 0 {
+        match ptrace_scope {
+            val if val == bindings::YAMA_SCOPE_DISABLED as ffi::c_int => {}
+            val if val == bindings::YAMA_SCOPE_RELATIONAL as ffi::c_int => {
+                let _guard = read_lock();
+                // SAFETY: `child` valid per this function's contract; RCU
+                // held via `_guard` for the whole block; `current_ptr` is
+                // the running task, always valid.
+                unsafe {
+                    if !pid_alive(child) {
+                        rc = -(bindings::EPERM as ffi::c_int);
+                    }
+
+                    if rc == 0
+                        && !task_is_descendant(current_ptr, child)
+                        && !ptracer_exception_found(current_ptr, child)
+                        && !bindings::ns_capable(
+                            (*bindings::rust_task_cred(child)).user_ns,
+                            bindings::CAP_SYS_PTRACE as i32,
+                        )
+                    {
+                        rc = -(bindings::EPERM as ffi::c_int);
+                    }
+                }
+            }
+            val if val == bindings::YAMA_SCOPE_CAPABILITY as ffi::c_int => {
+                let _guard = read_lock();
+                // SAFETY: `child` valid per this function's contract; RCU
+                // held via `_guard`.
+                unsafe {
+                    if !bindings::ns_capable(
+                        (*bindings::rust_task_cred(child)).user_ns,
+                        bindings::CAP_SYS_PTRACE as i32,
+                    ) {
+                        rc = -(bindings::EPERM as ffi::c_int);
+                    }
+                }
+            }
+            val if val == bindings::YAMA_SCOPE_NO_ATTACH as ffi::c_int => {
+                rc = -(bindings::EPERM as ffi::c_int);
+            }
+            _ => {
+                rc = -(bindings::EPERM as ffi::c_int);
+            }
+        }
+    }
+
+    if rc != 0 && (mode & bindings::PTRACE_MODE_NOAUDIT) == 0 {
+        // SAFETY: `child` valid per this function's contract;
+        // `_guard` holds `child->alloc_lock` for the duration of this call.
+        let _guard = unsafe { TaskLockGuard::new(child) };
+        unsafe {
+            rust_report_access(
+                c"attach".as_ptr().cast::<u8>(),
+                child,
+                current_ptr,
+            );
+        }
+    }
+
+    rc
+}
+```
+
+## Translation and safety considerations
+Several aspects of the translation show the practical challenges of writing kernel security logic in Rust.
+
+**Raw pointers and `unsafe`**. `struct task_struct *child` becomes `*mut bindings::task_struct`. All Rust functions that get called from C need to be marked `unsafe extern "C"`. Dereferencing C pointers requires `unsafe`, since the compiler cannot verify lifetimes of C-managed kernel objects.
+
+**Current task and credentials**. The running task is obtained via `current!()` and converted to a raw pointer for helpers that still use C-style `task_struct` pointers. Capability checks use bindings such as `rust_task_cred` and `ns_capable` in place of `__task_cred` and direct C field access.
+
+**RCU and auditing**. Relational and capability scopes use `read_lock()`, a proposed abstraction around `rcu_read_lock()` that is not yet in released kernels. The lock is released when the guard goes out of scope, or earlier via `Guard::unlock()`. Denied attaches call `rust_report_access` under a `TaskLockGuard`, adopted from the Rust-for-Linux RCU lock example, which is dropped in the same way when it leaves scope.
+
+**C versus Rust boundary**. Higher-level policy and helpers such as `task_is_descendant` and `ptracer_exception_found` were moved to Rust. Capability checks and some credential/task accessors remain FFI calls into C. Hook registration is still C-side; only the policy decision runs in Rust until registration itself is migrated.
+
+The Rust version is therefore not a line-for-line rewrite: the security decisions match, but locking, pointer validity, and FFI contracts are made more explicit through contracts, `SAFETY` comments, and scoped guards.
 
 # Testing
 To verify the functionality of the Rust implementation, I designed a small testing framework to allow quick and easy addition of tests, and reusability of setup functions.
@@ -59,11 +223,11 @@ There is a problem with the framework however that I was not able to fix. Settin
 - Continue the ongoing migration of the Yama LSM to Rust by moving the remaining components, including LSM registration, hook registration, and Yama-specific data structures. Although this work extends beyond the scope of the original project, it is currently in progress.
 - Continue developing safer Rust abstractions for Read-Copy Update (RCU) operations. In particular, investigate using Rust's lifetime system to guarantee that an RCU read lock is held whenever RCU-protected data is accessed, reducing the potential for incorrect API usage and minimising reliance on `unsafe` code.
 - Replace additional C helper functions and wrappers with safe Rust abstractions where possible, further reducing the reliance on `unsafe` code.
-- Increase automated test coverage to include additional ptrace scenarios, edge cases, and regression tests.
+- Increase automated test coverage to include additional `ptrace` scenarios, edge cases, and regression tests.
 - Evaluate the performance impact of the Rust implementation compared to the original C implementation.
 
 # Dependency Analysis
-The Yama implementation provided examples of both approaches. Higher-level abstractions such as `list_for_each_entry_rcu`, `list_entry_rcu`, and `container_of` were implemented mainly in Rust, with only the low-level operations delegated to existing C functions through bindings. For example, the iteration logic, type checking, pointer arithmetic, and macro expansion are implemented in Rust, while operations such as `rust_read_once` ultimately call the existing C implementation to perform the underlying memory access. This approach allows the majority of the implementation to benefit from Rust's type system while reusing existing kernel primitives where necessary.
+When migrating kernel code to Rust, dependencies can either be reimplemented in Rust or exposed through bindings to existing C functions. The Yama implementation provided examples of both approaches. Higher-level abstractions such as `list_for_each_entry_rcu`, `list_entry_rcu`, and `container_of` were implemented mainly in Rust, with only the low-level operations delegated to existing C functions through bindings. For example, the iteration logic, type checking, pointer arithmetic, and macro expansion are implemented in Rust, while operations such as `rust_read_once` ultimately call the existing C implementation to perform the underlying memory access. This approach allows the majority of the implementation to benefit from Rust's type system while reusing existing kernel primitives where necessary.
 
 In contrast, lower-level primitives such as `rcu_dereference` required Rust bindings to the existing C implementation. Although these bindings allow the functionality to be called from Rust, the underlying operation is still performed by C code. As a result, Rust provides limited additional safety for them, with most of the safety guarantees still depending on the correctness of the underlying C implementation.
 
@@ -76,13 +240,11 @@ Performing this dependency analysis before implementing a kernel component in Ru
 This analysis also helps assess the potential safety improvements that can be achieved through migration. Dependencies that ultimately resolve to low-level kernel primitives, such as memory access or RCU operations, are difficult to replace directly and typically require safe Rust abstractions over existing C implementations. Consequently, the greatest safety benefits are obtained by reimplementing higher-level control flow and data structure manipulation in Rust while encapsulating unavoidable interactions with low-level kernel functionality behind well-defined interfaces.
 
 # Reflection
-Throughout this project, I significantly expanded my knowledge of several areas, including Rust, the Rust borrow checker and lifetimes, the Linux kernel, C, and the interaction between different programming languages. The project also gave me experience of working on a large, established codebase rather than developing a standalone application, which was a valuable change from many of my previous programming projects.
-
-At the beginning of the project, I had relatively limited experience with Rust. One of the main areas I developed was my understanding of the Rust borrow checker, ownership, and lifetimes. Throughout this project, I significantly expanded my knowledge of several areas, including Rust, the Rust borrow checker and lifetimes, the Linux kernel, C, and the interaction between different programming languages. The project also gave me experience of working on a large, established codebase rather than developing a standalone application, which was a valuable change from many of my previous programming projects.
+At the beginning of the project, I had relatively limited experience with Rust. One of the main areas I developed was my understanding of the Rust borrow checker, ownership, and lifetimes. The project also gave me experience of working on a large, established codebase rather than developing a standalone application, which was a valuable change from many of my previous programming projects.
 
 I also developed my understanding of the Linux kernel considerably. Linux had already been an area of interest for me before starting the project, and I had previously experimented with writing a Linux kernel driver for a macro-pad. This gave me some initial familiarity with concepts such as kernel modules, kernel APIs, and the difference between kernel-space and user-space code. Working with Linux Security Modules built on this knowledge and introduced me to a different part of the kernel. Rather than interacting primarily with hardware or device interfaces, I was working with security hooks and examining how security decisions are made within the kernel. Investigating Yama's ptrace restrictions also required me to understand how different kernel components interact, including the capability system, LSM hooks, process relationships, credentials, and RCU-protected data structures.
 
-Another important area of learning was the interaction between C and Rust. Since the existing Yama implementation was written in C while the work involved implementing equivalent functionality in Rust, I had to understand how the two languages could work together through FFI. This involved learning more about Rust's foreign-function interface, kernel bindings, C-compatible types, and the considerations involved when passing kernel data structures between C and Rust. This was particularly interesting because it showed that introducing Rust into an existing C codebase does not necessarily mean rewriting the entire system. Instead, the two languages can work together by sharing resources, and calling each other's functions.
+Another important area of learning was the interaction between C and Rust. Since the existing Yama implementation was written in C while the work involved implementing equivalent functionality in Rust, I had to understand how the two languages could work together through FFI. This involved learning more about Rust's foreign-function interface, kernel bindings, C-compatible types, and the considerations involved when passing kernel data structures between C and Rust. This was particularly interesting because it showed that introducing Rust into an existing C codebase does not necessarily mean rewriting the entire system. Instead, the two languages can work together by sharing resources and calling each other's functions.
 
 The project also gave me experience with investigating software behaviour rather than relying solely on documentation or source-code inspection. I used debugging output, kernel instrumentation, call traces, and user-space test programs to determine which kernel paths were actually being executed. This was particularly useful when investigating the interaction between multiple LSM hooks. In some cases, the behaviour observed from user space was not immediately explained by the function being investigated, requiring me to trace the surrounding call path and understand the ordering of the security checks. This developed my ability to approach unfamiliar systems by forming hypotheses, testing them, and using the results to refine my understanding.
 
